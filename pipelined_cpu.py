@@ -1,56 +1,6 @@
-#!/usr/bin/env python3
-"""
-CSE 140 Project – Extra Credit: 5-Stage Pipelined RISC-V CPU
-=============================================================
-Supported instructions (17 total):
-
-  Section 1 (10): lw, sw, add, addi, sub, and, andi, or, ori, beq
-  Section 2  (2): jal, jalr
-  Extra Duty (5): lb, sb, bne, sll, srl
-
-Pipeline stages : IF → ID → EX → MEM → WB
-Stage registers : if_id, id_ex, ex_mem, mem_wb
-
-Hazard handling (no forwarding unit, no branch predictor):
-  * RAW hazard  – stall PC + IF/ID; insert bubble into ID/EX
-  * Branch/Jump – flush IF/ID + ID/EX after EX resolves target (2-cycle penalty)
-  * Flush always overrides stall when both occur in the same cycle
-
-──────────────────────────────────────────────────────────────
-HOW TO READ THE SECTION 1 RUBRIC MARKERS IN THIS FILE
-──────────────────────────────────────────────────────────────
-Every rubric item from Section 1 is marked with a banner like:
-  # ╔══ SECTION 1 RUBRIC: <Item Name> ══╗
-and ends with:
-  # ╚══ END: <Item Name> ══╝
-
-The items and where to find them:
-  1. Fetch()       → stage_IF()          (~line 490)
-  2. Decode()      → stage_ID() +        (~line 505)
-                     decode_fields()     (~line 310)
-  3. Execute()     → stage_EX()          (~line 540)
-  4. Mem()         → stage_MEM()         (~line 595)
-  5. Writeback()   → stage_WB()          (~line 655)
-  6. ControlUnit() → ControlUnit() +     (~line 235)
-                     ALUControl()        (~line 205)
-  7. Register file → global `rf`         (~line  72)
-  8. Data memory   → global `d_mem`      (~line  73)
-  9. Global pc     → global `pc`         (~line  68)
- 10. next_pc       → global / IF latch   (~line  68)
- 11. branch_target → EX_MEM latch        (~line 128)
- 12. alu_zero      → local in stage_EX   (~line 565)
- 13. total_clock_cycles → global         (~line  70)
-"""
-
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  ABI register name map                                       ║
-# ║  Used by Writeback to print human-readable register names    ║
-# ║  e.g.  x1 → "ra",  x10 → "a0",  x8 → "s0"                 ║
-# ╚══════════════════════════════════════════════════════════════╝
 ABI_NAMES = {
      0: "zero",  1: "ra",   2: "sp",   3: "gp",
      4: "tp",    5: "t0",   6: "t1",   7: "t2",
@@ -62,82 +12,34 @@ ABI_NAMES = {
     28: "t3",   29: "t4",  30: "t5",  31: "t6",
 }
 
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  SECTION 1 RUBRIC: Global Architectural State               ║
-# ║                                                              ║
-# ║  The spec requires these named global variables:            ║
-# ║    • pc               – current program counter             ║
-# ║    • next_pc          – pc + 4 (stored inside IF_ID latch   ║
-# ║                         and propagated through the pipeline) ║
-# ║    • branch_target    – computed in EX, stored in EX_MEM    ║
-# ║    • alu_zero         – 1-bit zero flag, local to stage_EX  ║
-# ║    • total_clock_cycles – incremented once per cycle        ║
-# ║    • rf[32]           – 32-entry integer register file      ║
-# ║    • d_mem[64]        – 64-entry data memory (word-indexed) ║
-# ║    • RegWrite, Branch, MemRead, MemWrite, MemtoReg,         ║
-# ║      ALUSrc, ALUOp    – carried inside CtrlSignals bundle   ║
-# ╚══════════════════════════════════════════════════════════════╝
-
-# Program counter: points to the instruction currently being fetched.
+#Section 1: global pc, total_clock_cyckes, rf, d_mem
+#points to the instruction currently being fetched.
 # Initialized to 0; updated every cycle (advance, hold on stall, or redirect on branch/jump).
 pc = 0
 
-# Cycle counter: incremented once at the end of every pipeline clock step.
+# incremented once at the end of every pipeline clock step.
 total_clock_cycles = 0
 
-# Register file: 32 general-purpose 32-bit registers.
+#32-bit registers.
 # x0 (index 0) is hardwired to zero and re-zeroed after every Writeback.
 rf = [0] * 32
 
-# Data memory: 64 word-sized slots (each slot = 4 bytes).
+#64 word-sized slots (each slot = 4 bytes).
 # Addressed by byte address; word index = byte_addr // 4.
-# e.g. address 0x70 maps to d_mem[0x70 // 4] = d_mem[28].
 d_mem = [0] * 64
 
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  SECTION 1 RUBRIC: Pipeline Stage Registers (Latches)       ║
-# ║                                                              ║
-# ║  Required by the Extra Credit spec:                         ║
-# ║    if_id, id_ex, ex_mem, mem_wb                             ║
-# ║  Each is a dataclass holding every signal that stage        ║
-# ║  produces.  `valid=False` marks a bubble (NOP).             ║
-# ╚══════════════════════════════════════════════════════════════╝
-
 @dataclass
 class IF_ID:
-    """
-    Latch between Instruction Fetch and Instruction Decode.
-    Holds the raw instruction word and the PC values for this instruction.
-    """
     valid:      bool = False   # False = bubble (no real instruction here)
     pc:         int  = 0       # PC of this instruction (used by JAL for jump target)
     next_pc:    int  = 0       # PC + 4 (passed forward as potential return address)
     instr_word: int  = 0       # 32-bit instruction fetched from program memory
 
-
+#Section 1: RegQrite, Branch, MemRead, MemWrite,  MemtoRef, ALUSrc
+#Section 2: Jump, JumpReg (jal/jalr)
 @dataclass
 class CtrlSignals:
-    """
-    Bundle of all control signals generated by ControlUnit().
-    Carried through every pipeline stage so each stage uses the
-    signals that belong to ITS instruction, not a later one.
-
-    SECTION 1 RUBRIC: ControlUnit() signals
-      RegWrite    – 1 = write result back to rd in the register file
-      branch_type – 0=none, 1=BEQ, 2=BNE  (replaces the spec's Boolean Branch)
-      MemRead     – 1 = read data memory this cycle (lw, lb)
-      MemWrite    – 1 = write data memory this cycle (sw, sb)
-      MemtoReg    – selects Writeback source:
-                    0 = ALU result  (R-type, I-type arithmetic)
-                    1 = memory data (lw, lb)
-                    2 = PC+4        (JAL, JALR return address)  [Section 2]
-      ALUSrc      – 0 = use rs2_val as ALU operand B
-                    1 = use sign-extended immediate as operand B
-      Jump        – 1 = JAL instruction   [Section 2]
-      JumpReg     – 1 = JALR instruction  [Section 2]
-    """
     RegWrite:    int = 0
     branch_type: int = 0   # 0=none, 1=BEQ, 2=BNE
     MemRead:     int = 0
@@ -147,14 +49,8 @@ class CtrlSignals:
     Jump:        int = 0   # Section 2: JAL
     JumpReg:     int = 0   # Section 2: JALR
 
-
 @dataclass
 class ID_EX:
-    """
-    Latch between Instruction Decode and Execute.
-    Carries decoded register values, the immediate, and control signals
-    into the EX stage so EX can operate without touching global state.
-    """
     valid:      bool        = False
     ctrl:       CtrlSignals = field(default_factory=CtrlSignals)
     pc:         int  = 0       # PC of this instruction (JAL needs it)
@@ -169,16 +65,9 @@ class ID_EX:
     mem_funct3: int  = 0       # raw funct3 forwarded to MEM for byte/word selection
     mnemonic:   str  = ""      # human-readable name for debugging
 
-
+#Section 1: branch_target
 @dataclass
 class EX_MEM:
-    """
-    Latch between Execute and Memory Access.
-
-    SECTION 1 RUBRIC: branch_target global variable
-      branch_target is stored here after EX computes it.
-      The pipeline loop reads branch_taken + branch_target to redirect PC.
-    """
     valid:         bool        = False
     ctrl:          CtrlSignals = field(default_factory=CtrlSignals)
     next_pc:       int  = 0       # PC+4, forwarded for JAL/JALR return-address WB
@@ -195,7 +84,6 @@ class EX_MEM:
 
 @dataclass
 class MEM_WB:
-    """Latch between Memory Access and Write Back."""
     valid:         bool        = False
     ctrl:          CtrlSignals = field(default_factory=CtrlSignals)
     next_pc:       int  = 0       # PC+4, used by WB for JAL/JALR return-address write
@@ -214,52 +102,25 @@ id_ex  = ID_EX()
 ex_mem = EX_MEM()
 mem_wb = MEM_WB()
 
-
-# ══════════════════════════════════════════════════════════════
-#  Utility helpers
-# ══════════════════════════════════════════════════════════════
-
+#pull bits from 32 char binary
 def extract_bits(bin_str: str, high: int, low: int) -> str:
-    """
-    Extract bits [high:low] (inclusive, RISC-V bit numbering) from a
-    32-character binary string.  Bit 31 is bin_str[0], bit 0 is bin_str[31].
-    """
     return bin_str[31 - high : 32 - low]
 
-
 def sign_extend(value: int, bits: int) -> int:
-    """
-    Sign-extend a `bits`-wide unsigned integer to a Python (arbitrary-width) int.
-    If the MSB of `value` is 1, the number is negative in two's complement.
-    """
     if value & (1 << (bits - 1)):
         return value - (1 << bits)
     return value
 
-
 def signed32(value: int) -> int:
-    """Interpret a 32-bit pattern as a signed integer (for SLT comparison)."""
     return value if value < (1 << 31) else value - (1 << 32)
 
-
 def to_hex32(value: int) -> str:
-    """Format any integer as a lowercase 32-bit hex string with 0x prefix."""
     return f"0x{value & 0xFFFFFFFF:x}"
 
-
 def reg_name(idx: int) -> str:
-    """Return the ABI name for a register index (e.g. 1 → 'ra', 10 → 'a0')."""
     return ABI_NAMES.get(idx, f"x{idx}")
 
-
 def parse_instruction_line(line: str) -> int:
-    """
-    Parse one line from the program file.
-    Accepts:
-      • 32-character binary string  ("00000111000001010010000110000011")
-      • 8-digit hex without prefix  ("07052183")
-      • hex with 0x prefix          ("0x07052183")
-    """
     text = line.strip()
     if not text:
         raise ValueError("empty line")
@@ -267,47 +128,20 @@ def parse_instruction_line(line: str) -> int:
         return int(text, 2)          # binary string
     return int(text.lower().replace("0x", ""), 16)   # hex string
 
-
 def instruction_to_bin(instr: int) -> str:
-    """Convert a 32-bit integer instruction to a zero-padded binary string."""
     return format(instr & 0xFFFFFFFF, "032b")
 
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  SECTION 1 RUBRIC: ALU Control                              ║
-# ║                                                              ║
-# ║  ALUControl() maps (ALUOp, funct3, funct7, opcode) to a     ║
-# ║  4-bit alu_ctrl code consumed by stage_EX().                ║
-# ║                                                              ║
-# ║  alu_ctrl encodings (per lecture slide):                    ║
-# ║    0b0000  AND                                               ║
-# ║    0b0001  OR                                                ║
-# ║    0b0010  ADD                                               ║
-# ║    0b0011  SLL  (Extra Duty – shift left logical)           ║
-# ║    0b0100  SRL  (Extra Duty – shift right logical)          ║
-# ║    0b0101  SLT  (set less than)                             ║
-# ║    0b0110  SUB                                               ║
-# ╚══════════════════════════════════════════════════════════════╝
-
+#Section 1: ALUControl, translating ALUOp, funct3, funct7 to 2 bit
 def ALUControl(alu_op: int, funct3: int, funct7: int, opcode: int) -> int:
-    """
-    ALU Control unit: converts the two-bit ALUOp signal (from ControlUnit) and
-    the instruction's funct3/funct7 fields into a 4-bit alu_ctrl code.
-
-    ALUOp truth table:
-      00 → always ADD  (memory address calculation for lw/sw/lb/sb, JAL, JALR)
-      01 → always SUB  (comparison for beq/bne: zero flag tells us equal or not)
-      10 → look at funct3/funct7 to pick the operation (R-type and I-type arith)
-    """
-    # ── ALUOp = 00: memory/jump address calculation always uses ADD ──
+    #ALUOp = 00: memory/jump address calculation always uses ADD
     if alu_op == 0b00:
         return 0b0010   # ADD
 
-    # ── ALUOp = 01: branch comparison always uses SUB (check zero flag) ──
+    #ALUOp = 01: branch comparison always uses SUB (check zero flag)
     if alu_op == 0b01:
         return 0b0110   # SUB
 
-    # ── ALUOp = 10: use funct3 / funct7 to select operation ──────────
+    #ALUOp = 10: use funct3 / funct7 to select operation
     if alu_op == 0b10:
 
         if opcode == 0x33:    # R-type instructions (funct7 distinguishes add vs sub)
@@ -330,47 +164,13 @@ def ALUControl(alu_op: int, funct3: int, funct7: int, opcode: int) -> int:
         f"funct3={funct3} funct7={funct7}"
     )
 
-# ╚══ END: ALU Control ══╝
-
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  SECTION 1 RUBRIC: ControlUnit()                            ║
-# ║                                                              ║
-# ║  Receives the 7-bit opcode (and funct3 for disambiguation). ║
-# ║  Sets all 7 control signals as per the lecture truth table. ║
-# ║  Then calls ALUControl() to get the 4-bit alu_ctrl code.   ║
-# ║                                                              ║
-# ║  Returns (CtrlSignals, alu_ctrl) so both are available      ║
-# ║  to Decode and passed forward through the pipeline.         ║
-# ╚══════════════════════════════════════════════════════════════╝
-
+#Section 1: ControlUnit, set control signals based on opcode
+#Section 2: add jal/jalr: extra duty reuses existing opcodes lb, sb, bne
 def ControlUnit(opcode: int, funct3: int = 0, funct7: int = 0):
-    """
-    Main control unit.  Maps opcode → control signal bundle + alu_ctrl.
-
-    Section 1 instructions and their signal settings:
-      lw   (0x03): RegWrite=1, MemRead=1, MemtoReg=1, ALUSrc=1, ALUOp=00
-      sw   (0x23): MemWrite=1, ALUSrc=1, ALUOp=00
-      beq  (0x63): branch_type=1, ALUOp=01
-      add/sub/and/or/slt (0x33): RegWrite=1, ALUSrc=0, ALUOp=10
-      addi/andi/ori (0x13): RegWrite=1, ALUSrc=1, ALUOp=10
-
-    Section 2 additions:
-      jal  (0x6F): Jump=1, RegWrite=1, MemtoReg=2 (return addr)
-      jalr (0x67): JumpReg=1, RegWrite=1, ALUSrc=1, MemtoReg=2
-
-    Extra Duty additions (lb/sb share opcodes with lw/sw; bne/sll/srl extend
-    existing opcode groups — no new signals needed beyond branch_type=2):
-      lb   (0x03, funct3=0): same signals as lw; MEM stage uses funct3 to read byte
-      sb   (0x23, funct3=0): same signals as sw; MEM stage uses funct3 to write byte
-      bne  (0x63, funct3=1): branch_type=2 instead of 1; ALUOp=01 (SUB same as BEQ)
-      sll  (0x33, funct3=1): same as other R-type; ALUControl picks 0b0011
-      srl  (0x33, funct3=5): same as other R-type; ALUControl picks 0b0100
-    """
     ctrl   = CtrlSignals()   # start with all signals = 0
     alu_op = 0
 
-    # ── Section 1: Load family ────────────────────────────────────────
+    #Section 1: Load
     # lw (funct3=2) and lb (funct3=0) both use the same control signals.
     # The MEM stage uses mem_funct3 to decide byte vs word access width.
     if opcode == 0x03:
@@ -380,14 +180,14 @@ def ControlUnit(opcode: int, funct3: int = 0, funct7: int = 0):
         ctrl.ALUSrc   = 1   # ALU operand B = immediate (address offset)
         alu_op = 0b00       # ALUOp=00 → ADD (compute effective address = rs1 + imm)
 
-    # ── Section 1: Store family ───────────────────────────────────────
+    #Section 1: Store
     # sw (funct3=2) and sb (funct3=0) both use the same control signals.
     elif opcode == 0x23:
         ctrl.MemWrite = 1   # write to data memory
         ctrl.ALUSrc   = 1   # ALU operand B = immediate (address offset)
         alu_op = 0b00       # ALUOp=00 → ADD (compute effective address = rs1 + imm)
 
-    # ── Section 1: Branch family ──────────────────────────────────────
+    #Section 1: Branch
     # beq (funct3=0) and bne (funct3=1) differ only in which zero-flag sense is used.
     elif opcode == 0x63:
         if   funct3 == 0x0: ctrl.branch_type = 1   # BEQ: branch when alu_zero==1
@@ -395,26 +195,26 @@ def ControlUnit(opcode: int, funct3: int = 0, funct7: int = 0):
         else: raise ValueError(f"Unsupported branch funct3={funct3}")
         alu_op = 0b01       # ALUOp=01 → SUB (rs1 - rs2; zero flag tells us equality)
 
-    # ── Section 1: R-type (add, sub, and, or, slt, sll, srl) ─────────
+    #Section 1: R-type (add, sub, and, or, slt, sll, srl)
     elif opcode == 0x33:
         ctrl.RegWrite = 1   # ALU result goes to register file
         ctrl.ALUSrc   = 0   # ALU operand B = rs2_val (not an immediate)
         alu_op = 0b10       # ALUOp=10 → use funct3/funct7 to pick operation
 
-    # ── Section 1: I-type arithmetic (addi, andi, ori) ───────────────
+    #Section 1: I-type arithmetic (addi, andi, ori)
     elif opcode == 0x13:
         ctrl.RegWrite = 1   # ALU result goes to register file
         ctrl.ALUSrc   = 1   # ALU operand B = sign-extended immediate
         alu_op = 0b10       # ALUOp=10 → use funct3 to pick operation
 
-    # ── Section 2: JAL ───────────────────────────────────────────────
+    #Section 2: JAL
     elif opcode == 0x6F:
         ctrl.Jump     = 1   # tells EX to compute PC+imm as jump target
         ctrl.RegWrite = 1   # rd = PC+4 (return address)
         ctrl.MemtoReg = 2   # Writeback mux: select PC+4
         alu_op = 0b00       # ADD (not actually used for JAL; target computed separately)
 
-    # ── Section 2: JALR ──────────────────────────────────────────────
+    #Section 2: JALR
     elif opcode == 0x67:
         ctrl.JumpReg  = 1   # tells EX to compute (rs1+imm)&~1 as jump target
         ctrl.RegWrite = 1   # rd = PC+4 (return address)
@@ -428,40 +228,17 @@ def ControlUnit(opcode: int, funct3: int = 0, funct7: int = 0):
     alu_ctrl = ALUControl(alu_op, funct3, funct7, opcode)
     return ctrl, alu_ctrl
 
-# ╚══ END: ControlUnit() ══╝
-
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  SECTION 1 RUBRIC: Decode() – instruction field extraction  ║
-# ║                                                              ║
-# ║  decode_fields() is a pure helper called by both stage_ID   ║
-# ║  and the hazard detector. It extracts every field from the  ║
-# ║  32-bit instruction word using RISC-V bit positions and     ║
-# ║  performs sign extension for immediate-bearing formats.      ║
-# ╚══════════════════════════════════════════════════════════════╝
-
+#Section 1: Decode, extract all fields from 32-bit instruction
+#Section 1: R, I, S, B
+#Section 2: J
 def decode_fields(instr_word: int) -> dict:
-    """
-    Decode a single 32-bit instruction word into all its constituent fields.
-
-    Returns a dict containing:
-      opcode, mnemonic, rd, rs1, rs2, funct3, funct7, imm,
-      ctrl (CtrlSignals), alu_ctrl (int), mem_funct3 (int)
-
-    RISC-V instruction formats handled:
-      R-type  [funct7|rs2|rs1|funct3|rd|opcode]   → add,sub,and,or,slt,sll,srl
-      I-type  [imm[11:0]|rs1|funct3|rd|opcode]    → addi,andi,ori,lw,lb,jalr
-      S-type  [imm[11:5]|rs2|rs1|funct3|imm[4:0]|opcode] → sw, sb
-      B-type  [imm[12|10:5]|rs2|rs1|funct3|imm[4:1|11]|opcode] → beq, bne
-      J-type  [imm[20|10:1|11|19:12]|rd|opcode]   → jal
-    """
     b   = instruction_to_bin(instr_word)     # 32-char binary string, bit31 at index 0
     opc = int(extract_bits(b, 6, 0), 2)      # bits[6:0] = opcode
 
     rd = rs1 = rs2 = funct3 = funct7 = imm = 0
     mnemonic = "nop"
 
-    # ── R-type: add, sub, and, or, slt, sll (Extra), srl (Extra) ────
+    #R-type: add, sub, and, or, slt, sll (Extra), srl (Extra)
     if opc == 0x33:
         # Field positions for R-type:
         #   bits[11:7]  = rd       (destination register)
@@ -484,7 +261,7 @@ def decode_fields(instr_word: int) -> dict:
             (0x5, 0x00): "srl",   # Extra Duty
         }.get((funct3, funct7), "r-type")
 
-    # ── I-type arithmetic: addi, andi, ori ──────────────────────────
+    #I-type arithmetic: addi, andi, ori
     elif opc == 0x13:
         # Field positions for I-type:
         #   bits[11:7]  = rd
@@ -497,7 +274,7 @@ def decode_fields(instr_word: int) -> dict:
         imm    = sign_extend(int(extract_bits(b, 31, 20), 2), 12)
         mnemonic = {0: "addi", 7: "andi", 6: "ori"}.get(funct3, "i-arith")
 
-    # ── Load family: lw (funct3=2) and lb (funct3=0, Extra Duty) ────
+    #Load: lw (funct3=2) and lb (funct3=0, Extra Duty)
     elif opc == 0x03:
         # Same I-type layout as addi etc; funct3 tells us byte vs word width.
         rd     = int(extract_bits(b, 11,  7), 2)
@@ -508,7 +285,7 @@ def decode_fields(instr_word: int) -> dict:
         elif funct3 == 0x0: mnemonic = "lb"   # Extra Duty
         else: raise ValueError(f"Unsupported load funct3={funct3}")
 
-    # ── Store family: sw (funct3=2) and sb (funct3=0, Extra Duty) ───
+    #Store: sw (funct3=2) and sb (funct3=0, Extra Duty)
     elif opc == 0x23:
         # S-type splits the immediate across two fields:
         #   imm[11:5] at bits[31:25],  imm[4:0] at bits[11:7]
@@ -522,7 +299,7 @@ def decode_fields(instr_word: int) -> dict:
         elif funct3 == 0x0: mnemonic = "sb"   # Extra Duty
         else: raise ValueError(f"Unsupported store funct3={funct3}")
 
-    # ── Branch family: beq (funct3=0) and bne (funct3=1, Extra Duty) ─
+    #Branch: beq (funct3=0) and bne (funct3=1, Extra Duty)
     elif opc == 0x63:
         # B-type splits the immediate with bits scattered across the word:
         #   imm[12]    at bit[31]
@@ -544,7 +321,7 @@ def decode_fields(instr_word: int) -> dict:
         elif funct3 == 0x1: mnemonic = "bne"   # Extra Duty
         else: raise ValueError(f"Unsupported branch funct3={funct3}")
 
-    # ── JAL: J-type (Section 2) ──────────────────────────────────────
+    #JAL: J-type (Section 2)
     elif opc == 0x6F:
         # J-type scatters imm[20:1] across 4 fields; imm[0] always 0.
         #   imm[20]    at bit[31]
@@ -561,7 +338,7 @@ def decode_fields(instr_word: int) -> dict:
         imm     = sign_extend(raw, 20) << 1   # <<1 converts imm[20:1] → byte offset
         mnemonic = "jal"
 
-    # ── JALR: I-type (Section 2) ─────────────────────────────────────
+    #JALR: I-type (Section 2)
     elif opc == 0x67:
         rd     = int(extract_bits(b, 11,  7), 2)
         funct3 = int(extract_bits(b, 14, 12), 2)
@@ -588,39 +365,12 @@ def decode_fields(instr_word: int) -> dict:
         mem_funct3 = funct3,   # raw funct3 kept for MEM-stage byte/word selection
     )
 
-# ╚══ END: Decode() field extraction ══╝
-
-
-# ══════════════════════════════════════════════════════════════
-#  Hazard detection  (Extra Credit – no forwarding unit)
-#
-#  With no forwarding, ANY instruction in ID that reads a register
-#  that EX or MEM hasn't committed yet must stall.
-#
-#  Stall sources checked each cycle (using OLD latches before EX runs):
-#    1. id_ex (EX stage)  – its result won't be in rf for 2 more cycles.
-#    2. ex_mem (MEM stage) – its result reaches WB next cycle, but WB in
-#       THIS cycle commits the OLD mem_wb, not ex_mem. So one more stall.
-# ══════════════════════════════════════════════════════════════
-
+#check instruction in IF/ID reads register
 def _writes_rd(valid: bool, ctrl: CtrlSignals, rd: int) -> bool:
-    """True if this stage will write a meaningful (non-zero) destination register."""
     return valid and ctrl.RegWrite and rd != 0
 
 
 def raw_hazard(if_id_l: IF_ID, id_ex_l: ID_EX, ex_mem_l: EX_MEM) -> bool:
-    """
-    Detect a Read-After-Write (RAW) data hazard.
-
-    Returns True (→ stall) if the instruction sitting in IF/ID needs to read
-    a register that an in-flight instruction (in EX or MEM) will write but
-    hasn't committed to rf yet.
-
-    Which registers does each instruction READ?
-      R-type, beq, bne, sw, sb  →  rs1 AND rs2
-      I-type arith, lw, lb, jalr →  rs1 only
-      jal                         →  neither (no register read)
-    """
     if not if_id_l.valid:
         return False          # nothing in IF/ID → no hazard possible
     try:
@@ -654,28 +404,8 @@ def raw_hazard(if_id_l: IF_ID, id_ex_l: ID_EX, ex_mem_l: EX_MEM) -> bool:
 
     return False
 
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  SECTION 1 RUBRIC: Fetch()  →  stage_IF()                  ║
-# ║                                                              ║
-# ║  Reads the instruction at pc from program memory.           ║
-# ║  Computes next_pc = pc + 4.                                 ║
-# ║  Returns (IF_ID latch, next sequential pc).                 ║
-# ║                                                              ║
-# ║  PC redirection (branch/jump) is handled by the main loop   ║
-# ║  AFTER EX resolves the target, and is NOT done here.        ║
-# ╚══════════════════════════════════════════════════════════════╝
-
+#Section 1: Fetch, read instruction at pc, compute next_pc = pc + 4
 def stage_IF(program: List[int], pc_in: int) -> tuple:
-    """
-    Instruction Fetch stage.
-
-    'program' is the list of 32-bit instruction words loaded from the input file.
-    pc_in // 4 converts the byte address to a word (list) index.
-
-    If pc_in is out of range (past the end of program), returns an invalid
-    (bubble) latch so the pipeline can drain naturally.
-    """
     index = pc_in // 4   # byte address → word index (each instruction is 4 bytes)
 
     if index < 0 or index >= len(program):
@@ -689,30 +419,8 @@ def stage_IF(program: List[int], pc_in: int) -> tuple:
     latch = IF_ID(valid=True, pc=pc_in, next_pc=next_pc, instr_word=instr_word)
     return latch, next_pc
 
-# ╚══ END: Fetch() ══╝
-
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  SECTION 1 RUBRIC: Decode()  →  stage_ID()                 ║
-# ║                                                              ║
-# ║  Decodes the instruction from IF_ID, calls ControlUnit(),   ║
-# ║  and reads rs1/rs2 values from the register file.           ║
-# ║  Populates the ID_EX latch for the Execute stage.           ║
-# ╚══════════════════════════════════════════════════════════════╝
-
+#Section 1: Decode, decode instruction, call ControlUnit, read rs1/rs2
 def stage_ID(if_id_in: IF_ID) -> ID_EX:
-    """
-    Instruction Decode stage.
-
-    Steps:
-      1. Call decode_fields() to extract opcode, registers, immediate, etc.
-      2. decode_fields() internally calls ControlUnit() → returns ctrl + alu_ctrl.
-      3. Read rs1 and rs2 values from the global register file (rf).
-      4. Pack everything into the ID_EX latch.
-
-    WB runs BEFORE ID within each clock cycle, so rf already holds the most
-    recently committed value — no forwarding path needed for WB→ID.
-    """
     if not if_id_in.valid:
         return ID_EX(valid=False)   # bubble passes through as bubble
 
@@ -737,60 +445,20 @@ def stage_ID(if_id_in: IF_ID) -> ID_EX:
         mnemonic   = f["mnemonic"],      # human-readable name (debug/demo only)
     )
 
-# ╚══ END: Decode() ══╝
-
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  SECTION 1 RUBRIC: Execute()  →  stage_EX()                ║
-# ║                                                              ║
-# ║  Runs the ALU operation specified by alu_ctrl.              ║
-# ║  Generates alu_zero (1-bit) for branch decisions.           ║
-# ║  Computes branch_target = next_pc + (imm << 1).             ║
-# ║  Determines branch_taken based on branch_type and alu_zero. ║
-# ║  [Section 2] Computes JAL / JALR jump targets.              ║
-# ╚══════════════════════════════════════════════════════════════╝
-
+#Section 1: Execute, runs ALU, sets alu_zero, compute branch_target
+#Section 2: compute jal/jalr jump targets
+#Extra: sll, srl
 def stage_EX(id_ex_in: ID_EX) -> EX_MEM:
-    """
-    Execute stage.
-
-    ALU operands:
-      op_a = rs1_val  (always)
-      op_b = imm      if ALUSrc == 1  (I-type, loads, stores, JALR)
-           = rs2_val  if ALUSrc == 0  (R-type, branches)
-
-    alu_ctrl truth table (4-bit code):
-      0b0000 → AND
-      0b0001 → OR
-      0b0010 → ADD
-      0b0011 → SLL  rd = rs1 << (rs2 & 0x1F)         [Extra Duty]
-      0b0100 → SRL  rd = unsigned(rs1) >> (rs2 & 0x1F)[Extra Duty]
-      0b0101 → SLT  rd = (signed rs1 < signed rs2) ? 1 : 0
-      0b0110 → SUB  (also used for beq/bne comparison)
-
-    alu_zero:
-      Set to 1 when alu_result == 0.
-      BEQ uses alu_zero==1 (subtraction result is 0 → operands are equal).
-      BNE uses alu_zero==0 (subtraction result is non-zero → operands differ).
-
-    branch_target:
-      Computed as next_pc + (imm << 1).
-      The B-type encoding stores imm[12:1]; <<1 appends the implicit bit-0=0.
-
-    jump_target (Section 2):
-      JAL:  PC + imm           (offset already byte-addressed from decode)
-      JALR: (rs1_val + imm) & ~1  (clear bit 0 per RISC-V spec)
-    """
     if not id_ex_in.valid:
         return EX_MEM(valid=False)
 
     ctrl = id_ex_in.ctrl
 
-    # ── Select ALU operand B ──────────────────────────────────────────
+    #Select ALU operand B
     op_a = id_ex_in.rs1_val
     op_b = id_ex_in.imm if ctrl.ALUSrc else id_ex_in.rs2_val
 
-    # ── Execute ALU operation ─────────────────────────────────────────
+    #Execute ALU operation
     ac = id_ex_in.alu_ctrl
     if   ac == 0b0000: alu_result = op_a & op_b                             # AND
     elif ac == 0b0001: alu_result = op_a | op_b                             # OR
@@ -801,12 +469,12 @@ def stage_EX(id_ex_in: ID_EX) -> EX_MEM:
     elif ac == 0b0110: alu_result = op_a - op_b                             # SUB
     else:              alu_result = 0
 
-    # ── SECTION 1 RUBRIC: alu_zero ───────────────────────────────────
+    #SECTION 1 RUBRIC: alu_zero 
     # 1-bit flag: 1 when the ALU result is exactly zero.
     # Used by BEQ (branch if equal) and BNE (branch if not equal).
     alu_zero = (alu_result == 0)
 
-    # ── SECTION 1 RUBRIC: branch_target ──────────────────────────────
+    #SECTION 1 RUBRIC: branch_target
     # Branch target = next_pc (PC+4) + byte offset.
     # The B-type imm field stores offset/2; <<1 recovers the byte offset.
     branch_target = id_ex_in.next_pc + (id_ex_in.imm << 1)
@@ -816,7 +484,7 @@ def stage_EX(id_ex_in: ID_EX) -> EX_MEM:
     elif ctrl.branch_type == 2: branch_taken = bool(not alu_zero)   # BNE [Extra Duty]
     else:                       branch_taken = False                 # not a branch
 
-    # ── Section 2: Jump target computation ───────────────────────────
+    #Section 2: Jump target computation
     jump_target = 0
     if ctrl.Jump:
         # JAL: jump to PC + sign-extended J-type offset (already byte-addressed)
@@ -842,39 +510,9 @@ def stage_EX(id_ex_in: ID_EX) -> EX_MEM:
         mnemonic      = id_ex_in.mnemonic,
     )
 
-# ╚══ END: Execute() ══╝
-
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  SECTION 1 RUBRIC: Mem()  →  stage_MEM()                   ║
-# ║                                                              ║
-# ║  Accesses data memory for load and store instructions.      ║
-# ║  All other instructions pass through without touching d_mem.║
-# ║                                                              ║
-# ║  d_mem layout:                                              ║
-# ║    Each entry = one 4-byte word.                            ║
-# ║    Byte address 0x00 → d_mem[0]                             ║
-# ║    Byte address 0x04 → d_mem[1]   …   0x7C → d_mem[31]     ║
-# ║                                                              ║
-# ║  Extended for Extra Duty (lb/sb byte granularity):          ║
-# ║    mem_funct3 == 0x2 → word (lw / sw)                       ║
-# ║    mem_funct3 == 0x0 → byte (lb / sb)                       ║
-# ╚══════════════════════════════════════════════════════════════╝
-
+#Section 1: Memory access, lw reads word, sw writes word
+#Ectra: lb reads 1 byte, sign-extends it, sb writes 1 bytes
 def stage_MEM(ex_mem_in: EX_MEM) -> MEM_WB:
-    """
-    Memory Access stage.
-
-    For lw  : reads the full 32-bit word at the aligned word address.
-    For lb  : reads one byte at byte_addr, sign-extends it to 32 bits.  [Extra]
-    For sw  : writes the full 32-bit value of rs2 to the word address.
-    For sb  : writes only the low 8 bits of rs2 to the byte lane,
-              leaving the other 3 bytes of the word unchanged.           [Extra]
-
-    The effective byte address comes from the ALU result (rs1 + imm).
-      word_idx  = byte_addr // 4   (which d_mem entry)
-      byte_lane = byte_addr  % 4   (which byte within that word; 0 = LSB)
-    """
     if not ex_mem_in.valid:
         return MEM_WB(valid=False)
 
@@ -887,7 +525,7 @@ def stage_MEM(ex_mem_in: EX_MEM) -> MEM_WB:
     word_idx  = addr // 4                            # index into d_mem array
     byte_lane = addr  % 4                            # byte offset within the word
 
-    # ── SECTION 1 RUBRIC: Load (MemRead) ─────────────────────────────
+    #SECTION 1 RUBRIC: Load (MemRead) 
     if ctrl.MemRead:
         if ex_mem_in.mem_funct3 == 0x0:
             # lb [Extra Duty]: extract the target byte, then sign-extend to 32 bits.
@@ -899,7 +537,7 @@ def stage_MEM(ex_mem_in: EX_MEM) -> MEM_WB:
             # lw: read the entire 32-bit word (byte address must be word-aligned)
             mem_data = d_mem[word_idx]
 
-    # ── SECTION 1 RUBRIC: Store (MemWrite) ───────────────────────────
+    #SECTION 1 RUBRIC: Store (MemWrite)
     if ctrl.MemWrite:
         if ex_mem_in.mem_funct3 == 0x0:
             # sb [Extra Duty]: write only the low 8 bits of rs2 to byte_lane.
@@ -929,41 +567,16 @@ def stage_MEM(ex_mem_in: EX_MEM) -> MEM_WB:
         mnemonic      = ex_mem_in.mnemonic,
     )
 
-# ╚══ END: Mem() ══╝
-
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  SECTION 1 RUBRIC: Writeback()  →  stage_WB()              ║
-# ║                                                              ║
-# ║  Writes the instruction result back to the register file.   ║
-# ║  Also prints the output lines required by the spec.         ║
-# ║  Increments total_clock_cycles (done in the main loop).     ║
-# ║                                                              ║
-# ║  MemtoReg mux selects the write-back source:                ║
-# ║    0 → ALU result  (R-type, I-type arithmetic)              ║
-# ║    1 → memory data (lw, lb)                                 ║
-# ║    2 → PC+4        (JAL, JALR return address) [Section 2]  ║
-# ╚══════════════════════════════════════════════════════════════╝
-
+#Section 1: Writeback, result to register file, prints output
+#Section 2: MemtoReg selects PC+4 as write value return address for jal, jalr
 def stage_WB(mem_wb_in: MEM_WB) -> List[str]:
-    """
-    Write Back stage.
-
-    Runs FIRST within each clock cycle (before Decode reads rf) so that an
-    instruction completing WB in cycle N is immediately visible to the
-    instruction entering Decode in cycle N — no forwarding path needed.
-
-    Returns a list of human-readable output strings (may be empty for
-    instructions that don't modify rf or memory, e.g. beq not taken).
-    The main loop prints these together with the cycle number and pc.
-    """
     if not mem_wb_in.valid:
         return []   # bubble: nothing to commit
 
     ctrl     = mem_wb_in.ctrl
     messages = []
 
-    # ── Write to register file (if RegWrite and rd != x0) ────────────
+    #Write to register file (if RegWrite and rd != x0)
     if ctrl.RegWrite and mem_wb_in.rd != 0:
         # MemtoReg mux: choose what gets written to rd
         if ctrl.MemtoReg == 1:
@@ -979,7 +592,7 @@ def stage_WB(mem_wb_in: MEM_WB) -> List[str]:
             f"{reg_name(mem_wb_in.rd)} is modified to {to_hex32(rf[mem_wb_in.rd])}"
         )
 
-    # ── Report memory write (sw / sb) ────────────────────────────────
+    #Report memory write (sw / sb)
     if mem_wb_in.store_address is not None:
         messages.append(
             f"memory {to_hex32(mem_wb_in.store_address)} is modified to "
@@ -990,47 +603,7 @@ def stage_WB(mem_wb_in: MEM_WB) -> List[str]:
     rf[0] = 0
     return messages
 
-# ╚══ END: Writeback() ══╝
-
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  SECTION 1 RUBRIC: Main simulation loop  →  run_pipeline()  ║
-# ║                                                              ║
-# ║  Ties all five stages together into one clock cycle.        ║
-# ║  Handles the PC mux (next_pc vs branch_target vs stall).    ║
-# ║  Increments total_clock_cycles once per iteration.          ║
-# ║  Prints output when Writeback retires a real instruction.   ║
-# ╚══════════════════════════════════════════════════════════════╝
-
 def run_pipeline(program: List[int]) -> None:
-    """
-    Clock-accurate pipeline simulation.
-
-    CYCLE ORDERING (critical for correctness):
-      Within one clock cycle we process stages in this order:
-        1. WB  – commits to rf FIRST so Decode reads the up-to-date value
-        2. RAW hazard check – uses OLD latches (before this cycle's EX fires)
-        3. MEM – reads/writes d_mem
-        4. EX  – runs the ALU, computes branch/jump targets
-        5. Flush check – if EX resolved a taken branch/jump, flush IF+ID
-        6. ID  – decode (produces bubble if stall or flush)
-        7. IF  – fetch (flush overrides stall)
-        8. Commit all new latch values simultaneously
-        9. Update pc
-       10. Increment total_clock_cycles
-       11. Print output if WB retired a real instruction
-       12. Termination check
-
-    HAZARD HANDLING (Extra Credit pipeline):
-      Stall  – PC and IF/ID held; bubble inserted into ID/EX.
-               Triggered by RAW hazard (EX or MEM stage will write a reg
-               that the instruction in ID needs to read).
-      Flush  – IF/ID and ID/EX replaced with bubbles; PC redirected to
-               branch_target or jump_target.
-               Triggered by any taken branch (BEQ/BNE) or any jump (JAL/JALR).
-      Priority: flush > stall (if both occur in the same cycle, flush wins
-               and the previously-stalled instruction is discarded).
-    """
     global pc, total_clock_cycles
     global if_id, id_ex, ex_mem, mem_wb
 
@@ -1039,22 +612,22 @@ def run_pipeline(program: List[int]) -> None:
 
     while True:
 
-        # ── Step 1: Writeback ─────────────────────────────────────────
+        #Step 1: Writeback 
         # WB runs before everything else so rf is up-to-date when ID reads it.
         wb_messages  = stage_WB(mem_wb)
         wb_had_valid = mem_wb.valid   # remember if a real instruction was here
 
-        # ── Step 2: RAW hazard check ──────────────────────────────────
+        #Step 2: RAW hazard check 
         # Uses the CURRENT (old) id_ex and ex_mem latches — before EX fires.
         stall = raw_hazard(if_id, id_ex, ex_mem)
 
-        # ── Step 3: Memory Access ─────────────────────────────────────
+        #Step 3: Memory Access 
         new_mem_wb = stage_MEM(ex_mem)
 
-        # ── Step 4: Execute ───────────────────────────────────────────
+        #Step 4: Execute 
         new_ex_mem = stage_EX(id_ex)
 
-        # ── Step 5: Branch / Jump flush detection ─────────────────────
+        #Step 5: Branch / Jump flush detection 
         # If EX resolved a taken branch or any jump, we must flush the two
         # instructions that have already entered IF and ID (they are wrong-path).
         flush  = False
@@ -1066,11 +639,11 @@ def run_pipeline(program: List[int]) -> None:
                 else new_ex_mem.branch_target
             ) & 0xFFFFFFFF
 
-        # ── Step 6: Decode ────────────────────────────────────────────
+        #Step 6: Decode 
         # If stalling OR flushing, insert a bubble instead of decoding.
         new_id_ex = ID_EX(valid=False) if (stall or flush) else stage_ID(if_id)
 
-        # ── Step 7: Instruction Fetch ─────────────────────────────────
+        #Step 7: Instruction Fetch 
         # Priority: flush > stall > normal fetch.
         # Flush wins even if a stall was also pending (flush discards the stalled instr).
         if flush:
@@ -1084,14 +657,14 @@ def run_pipeline(program: List[int]) -> None:
             if not new_if_id.valid:
                 program_done = True          # just ran off the end of the program
 
-        # ── Step 8: Commit all latches simultaneously ─────────────────
+        #Step 8: Commit all latches simultaneously 
         # All four stage registers are updated at once, modelling a rising clock edge.
         mem_wb = new_mem_wb
         ex_mem = new_ex_mem
         id_ex  = new_id_ex
         if_id  = new_if_id
 
-        # ── Step 9: Update PC ─────────────────────────────────────────
+        #Step 9: Update PC 
         # SECTION 1 RUBRIC: the PC mux choosing among next_pc, branch_target
         if flush:
             pc = new_pc                  # redirect to branch/jump target
@@ -1100,11 +673,11 @@ def run_pipeline(program: List[int]) -> None:
         elif not program_done:
             pc = next_sequential_pc      # normal sequential advance
 
-        # ── Step 10: Increment cycle counter ─────────────────────────
+        #Step 10: Increment cycle counter 
         # SECTION 1 RUBRIC: total_clock_cycles incremented once per cycle
         total_clock_cycles += 1
 
-        # ── Step 11: Print output when WB retires a real instruction ──
+        #Step 11: Print output when WB retires a real instruction 
         # SECTION 1 RUBRIC: print rf/d_mem changes and pc after each instruction
         if wb_had_valid:
             print(f"total_clock_cycles {total_clock_cycles} :")
@@ -1112,7 +685,7 @@ def run_pipeline(program: List[int]) -> None:
                 print(msg)
             print(f"pc is modified to {to_hex32(pc)}")
 
-        # ── Step 12: Termination ──────────────────────────────────────
+        #Step 12: Termination 
         # Stop when the program is done fetching AND all four stage registers
         # have drained to bubbles (every in-flight instruction has retired).
         all_empty = (
@@ -1125,28 +698,12 @@ def run_pipeline(program: List[int]) -> None:
     print("program terminated:")
     print(f"total execution time is {total_clock_cycles} cycles")
 
-# ╚══ END: Main simulation loop ══╝
-
-
-# ══════════════════════════════════════════════════════════════
-#  Initialization helpers
-#  Each function sets the register file and data memory to the
-#  state specified by the project rubric, then resets all latches.
-# ══════════════════════════════════════════════════════════════
-
 def _reset_pipeline() -> None:
-    """Reset all four pipeline stage registers to empty bubbles."""
     global if_id, id_ex, ex_mem, mem_wb
     if_id = IF_ID(); id_ex = ID_EX(); ex_mem = EX_MEM(); mem_wb = MEM_WB()
 
 
 def initialize_section1() -> None:
-    """
-    Section 1 initial state (used with sample_part1.txt).
-    Per project spec:
-      x1 = 0x20, x2 = 0x5, x10 = 0x70, x11 = 0x4
-      d_mem[0x70//4] = 0x5,  d_mem[0x74//4] = 0x10
-    """
     global pc, total_clock_cycles, rf, d_mem
     pc = total_clock_cycles = 0
     rf    = [0] * 32
@@ -1161,12 +718,6 @@ def initialize_section1() -> None:
 
 
 def initialize_section2() -> None:
-    """
-    Section 2 initial state (used with sample_part2.txt).
-    Per project spec:
-      s0=0x20, a0=0x5, a1=0x2, a2=0xa, a3=0xf
-      d_mem all zeros
-    """
     global pc, total_clock_cycles, rf, d_mem
     pc = total_clock_cycles = 0
     rf    = [0] * 32
@@ -1180,20 +731,6 @@ def initialize_section2() -> None:
 
 
 def initialize_extra() -> None:
-    """
-    Extra Duty initial state (used with sample_extra.txt).
-    Registers chosen to produce clear, hand-verifiable results for
-    lb, sb, bne, sll, and srl.
-
-      ra (x1)  = 0x20  base address for lb / sb tests
-      sp (x2)  = 0x4   shift amount for sll / srl
-      gp (x3)  = 0xAB  byte payload for sb; also source for sll/srl
-      tp (x4)  = 0x3   bne operand (differs from t0 → branch taken)
-      t0 (x5)  = 0x7   bne operand (differs from tp → branch taken)
-      t1 (x6)  = 0x3   unused in current sample; available for beq testing
-
-    d_mem[0x20 // 4] = 0xDEADBEEF  so lb can load a known byte value.
-    """
     global pc, total_clock_cycles, rf, d_mem
     pc = total_clock_cycles = 0
     rf    = [0] * 32
@@ -1208,16 +745,7 @@ def initialize_extra() -> None:
     _reset_pipeline()
 
 
-# ══════════════════════════════════════════════════════════════
-#  Program loader
-# ══════════════════════════════════════════════════════════════
-
 def load_program(filename: str) -> List[int]:
-    """
-    Read a program file and return a list of 32-bit instruction words.
-    Lines starting with '#' or '//' are treated as comments and skipped.
-    Accepts both binary-string and hex formats (see parse_instruction_line).
-    """
     program = []
     with open(filename, "r", encoding="utf-8") as fh:
         for raw in fh:
@@ -1227,16 +755,7 @@ def load_program(filename: str) -> List[int]:
             program.append(parse_instruction_line(line))
     return program
 
-
-# ══════════════════════════════════════════════════════════════
-#  Entry point
-# ══════════════════════════════════════════════════════════════
-
 def main() -> None:
-    """
-    Ask for the program filename, select the matching initialization state,
-    load the program, and run the pipeline simulation.
-    """
     filename = input("Enter the program file name to run:\n").strip()
 
     # Select initialization based on filename convention
