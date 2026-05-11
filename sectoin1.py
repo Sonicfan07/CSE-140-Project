@@ -49,7 +49,6 @@ def reg_name(idx: int) -> str:
 
 
 def parse_instruction_line(line: str) -> int:
-    """Accepts 32-bit binary or 8-digit hex with/without 0x."""
     text = line.strip()
     if not text:
         raise ValueError("empty instruction line")
@@ -271,9 +270,8 @@ def Decode(instr_word: int) -> Tuple[DecodedInstruction, int]:
         imm10_5 = int(extract_bits(bin_str, 30, 25), 2)
         imm4_1 = int(extract_bits(bin_str, 11, 8), 2)
         imm11 = int(extract_bits(bin_str, 7, 7), 2)
-        # Keep the decoded branch offset *before* the datapath's shift-left-1.
-        # The project PDF says Execute() should shift-left-1 the sign-extended offset
-        # and then add it to PC+4.
+        # decoded branch offset the datapath's shift-left-1.
+        # should shift-left-1 the sign-extended offset and then add it to PC+4.
         imm = sign_extend((imm12 << 11) | (imm11 << 10) | (imm10_5 << 4) | imm4_1, 12)
         if funct3 != 0x0:
             raise ValueError("Only beq is supported for branch opcode in Section 1")
@@ -323,7 +321,7 @@ def Execute(decoded: DecodedInstruction, alu_ctrl: int) -> ExecuteResult:
 
     alu_zero = 1 if alu_result == 0 else 0
 
-    # The project PDF explicitly says: shift-left-1 offset, then add to PC+4.
+    # shift-left-1 offset, add to PC+4.
     branch_target = next_pc + (decoded.imm << 1)
     branch_taken = bool(Branch and alu_zero)
 
@@ -408,7 +406,6 @@ def initialize_arch_state() -> None:
     rf = [0] * 32
     d_mem = [0] * 64
 
-    # Project sample initialization for Section 1
     rf[1] = 0x20
     rf[2] = 0x5
     rf[10] = 0x70

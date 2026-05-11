@@ -15,7 +15,7 @@ ABI_NAMES = {
 pc = 0
 next_pc = 0
 branch_target = 0
-jump_target = 0          # NEW: computed by Execute() for JAL/JALR
+jump_target = 0          #computed by Execute() for JAL/JALR
 alu_zero = 0
 total_clock_cycles = 0
 
@@ -108,7 +108,7 @@ class ExecuteResult:
     store_data:   int
     rd:           int
     branch_taken: bool
-    jump_taken:   bool           # NEW
+    jump_taken:   bool        
     mem_address:  int
 
 
@@ -117,7 +117,7 @@ class MemResult:
     alu_result:   int
     mem_data:     int
     rd:           int
-    wb_pc4:       int            # NEW: next_pc captured for JAL/JALR writeback
+    wb_pc4:       int            #next_pc for JAL/JALR writeback
     store_address: Optional[int] = None
     store_value:   Optional[int] = None
 
@@ -254,13 +254,13 @@ def Decode(instr_word: int) -> Tuple[DecodedInstruction, int]:
 
     #JAL (J-type)
     elif opcode == 0x6F:
-        # J-type immediate: imm[20|10:1|11|19:12] scattered across the word
+        # J-type immediate: imm[20|10:1|11|19:12]
         rd      = int(extract_bits(bin_str, 11,  7), 2)
         imm20   = int(extract_bits(bin_str, 31, 31), 2)
         imm10_1 = int(extract_bits(bin_str, 30, 21), 2)
         imm11   = int(extract_bits(bin_str, 20, 20), 2)
         imm19_12= int(extract_bits(bin_str, 19, 12), 2)
-        # Reassemble: [20|19:12|11|10:1] then append implicit 0 at LSB
+        # Reassemble [20|19:12|11|10:1] then append implicit 0 at LSB
         raw_imm = (imm20 << 19) | (imm19_12 << 11) | (imm11 << 10) | imm10_1
         imm = sign_extend(raw_imm, 20) << 1   # already byte-addressed offset
         mnemonic = "jal"
@@ -309,11 +309,10 @@ def Execute(decoded: DecodedInstruction, alu_ctrl: int) -> ExecuteResult:
 
     alu_zero = 1 if alu_result == 0 else 0
 
-    # Branch target: next_pc + (sign-extended offset << 1)
-    # (imm stored in decoded is already the raw 12-bit field; Execute shifts it)
+    #branch target: next_pc + (sign-extended offset << 1)
     branch_target = next_pc + (decoded.imm << 1)
 
-    #Jump target calculation
+    #jump target calculation
     # JAL:  PC + imm  (imm already holds the full byte offset after Decode)
     # JALR: (rs1 + imm) with LSB cleared (RISC-V spec §2.5)
     if Jump:
@@ -392,7 +391,7 @@ def Writeback(mem_result: MemResult, ex_result: ExecuteResult) -> List[str]:
             f"{to_hex32(mem_result.store_value)}"
         )
 
-    # PC selection priority: jump > branch > sequential
+    #jump > branch > sequential
     if ex_result.jump_taken:
         pc = jump_target & 0xFFFFFFFF
     elif ex_result.branch_taken:
